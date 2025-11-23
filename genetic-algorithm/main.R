@@ -118,40 +118,69 @@ ga_result <- ga(
 best_solution <- ga_result@solution[1, ]
 print("Алгоритм завершен!")
 
-# --- БЛОК 5: КАРТА (LEAFLET) ---
+# --- БЛОК 5: КАРТА С РЕАЛЬНЫМИ ДОРОГАМИ (OSRM) ---
 
-# 1. Функция подготовки линий
-get_routes_list <- function(tour) {
-  routes <- list()
+print("Построение детальных маршрутов... Это может занять время.")
+
+# 1. Функция получения детальной геометрии маршрутов
+get_detailed_routes <- function(tour) {
+  routes_sf <- list() # Список для хранения sf объектов (линий)
   truck_load <- 0
-  current_route_coords <- data.frame(lat = depot_coords[1], lon = depot_coords[2])
   truck_id <- 1
-
+  
+  # Координаты склада (lon, lat) для osrm
+  curr_pos <- c(depot_coords[2], depot_coords[1]) 
+  depot_pos <- c(depot_coords[2], depot_coords[1])
+  
+  # Временный список сегментов для одной машины
+  trip_segments <- list()
+  
   for (i in 1:length(tour)) {
     client_id <- tour[i]
     client_row <- customers[customers$id == client_id, ]
+    target_pos <- c(client_row$lon, client_row$lat)
     dem <- client_row$demand
-
+    
+    # Проверка вместимости (как в фитнес-функции)
     if (truck_load + dem > truck_capacity) {
-      current_route_coords <- rbind(current_route_coords, c(depot_coords[1], depot_coords[2]))
-      routes[[truck_id]] <- current_route_coords
+      # 1. Едем обратно в депо
+      route_segment <- osrmRoute(src = curr_pos, dst = depot_pos, overview = "full", returnclass = "sf")
+      trip_segments[[length(trip_segments) + 1]] <- route_segment
+      
+      # Сохраняем маршрут текущего грузовика (объединяем сегменты)
+      if(length(trip_segments) > 0) {
+        routes_sf[[truck_id]] <- do.call(rbind, trip_segments)
+      }
+      
+      # 2. Сброс для нового грузовика
       truck_id <- truck_id + 1
       truck_load <- 0
-      current_route_coords <- data.frame(lat = depot_coords[1], lon = depot_coords[2])
+      curr_pos <- depot_pos
+      trip_segments <- list()
     }
-    current_route_coords <- rbind(current_route_coords, c(client_row$lat, client_row$lon))
+    
+    # Едем к клиенту (запрос реальной дороги)
+    # overview = "full" дает полную геометрию поворотов
+    route_segment <- osrmRoute(src = curr_pos, dst = target_pos, overview = "full", returnclass = "sf")
+    trip_segments[[length(trip_segments) + 1]] <- route_segment
+    
     truck_load <- truck_load + dem
+    curr_pos <- target_pos
   }
-  current_route_coords <- rbind(current_route_coords, c(depot_coords[1], depot_coords[2]))
-  routes[[truck_id]] <- current_route_coords
-  return(routes)
+  
+  # Возврат последнего грузовика в депо
+  route_segment <- osrmRoute(src = curr_pos, dst = depot_pos, overview = "full", returnclass = "sf")
+  trip_segments[[length(trip_segments) + 1]] <- route_segment
+  routes_sf[[truck_id]] <- do.call(rbind, trip_segments)
+  
+  return(routes_sf)
 }
 
-# 2. Построение карты
-truck_routes <- get_routes_list(best_solution)
-truck_ids <- 1:length(truck_routes)
-colors <- colorFactor(palette = "Set1", domain = truck_ids)
+# 2. Получение данных (это займет время на запросы к API)
+truck_routes_sf <- get_detailed_routes(best_solution)
+colors <- colorFactor(palette = "Set1", domain = 1:length(truck_routes_sf))
 
+# 3. Инициализация карты
 map <- leaflet() %>%
   addTiles() %>%
   addMarkers(
@@ -165,20 +194,30 @@ map <- leaflet() %>%
     popup = ~ paste("<b>Client ID:</b>", id, "<br>Demand:", demand, "kg")
   )
 
-for (i in 1:length(truck_routes)) {
-  route_data <- truck_routes[[i]]
-  map <- map %>%
-    addPolylines(
-      data = route_data, lng = ~lon, lat = ~lat,
-      color = colors(i), weight = 3, opacity = 0.8,
-      group = paste("Truck", i), popup = paste("Маршрут №", i)
-    )
+# 4. Добавление слоев с маршрутами
+for (i in 1:length(truck_routes_sf)) {
+  # Проверяем, есть ли данные для маршрута
+  if (!is.null(truck_routes_sf[[i]])) {
+    map <- map %>%
+      addPolylines(
+        data = truck_routes_sf[[i]],
+        color = colors(i),
+        weight = 4,
+        opacity = 0.8,
+        group = paste("Truck", i),
+        popup = paste("Маршрут машины №", i)
+      )
+  }
 }
 
-map <- map %>% addLayersControl(overlayGroups = paste("Truck", 1:length(truck_routes)), options = layersControlOptions(collapsed = FALSE))
+# Управление слоями
+map <- map %>% addLayersControl(
+  overlayGroups = paste("Truck", 1:length(truck_routes_sf)),
+  options = layersControlOptions(collapsed = FALSE)
+)
 
-# Вывод и сохранение
 print(map)
+print("Карта с дорогами построена.")
 
 # --- БЛОК 6: ОТЧЕТ (MANIFEST) ---
 print_manifest <- function(tour) {
