@@ -1,0 +1,13 @@
+type,vehicle_type,capacity,fixed_cost,cost_per_km,required_end_fuel,fuel_consumption_per_km,tank_capacity
+V1,SmallTruck,150,9500,25,100.0,10,200
+V2,SmallTruck,150,8900,20,85.0,10,170
+V3,Van,100,5400,16,52.5,0.66,105
+V4,Van,100,6700,19,42.5,0.55,85
+V5,Van,100,5000,16,62.5,0.52,125
+V6,Van,100,6100,15,45.0,0.67,90
+V7,Minivan,70,4200,12,37.5,0.22,75
+V8,Minivan,70,5000,10,50.0,0.33,100
+V9,Car,50,1300,7,22.5,0.15,45
+V10,Car,50,2200,9,40.0,0.1,80
+V11,Car,50,2300,5,20.0,0.18,40
+V12,Car,50,1800,5,25.0,0.18,50

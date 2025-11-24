@@ -5,51 +5,62 @@ library(dplyr)
 library(GA)
 library(htmlwidgets)
 
-# Константы ограничений
-truck_capacity <- 100 # вместимость
-max_trucks <- 10 # максимум машин
-penalty_late <- 10000 # штраф за опоздание
-penalty_overload <- 10000 # штраф за перегруз по весу
-penalty_truck <- 500 # штраф за использование лишней машины
+# Параметры штрафов
+penalty_late <- 10000
+penalty_overload <- 10000
+penalty_truck <- 500
 
-# --- БЛОК 2: ДАННЫЕ И OSRM ---
+# --- БЛОК 2: ЗАГРУЗКА ДАННЫХ ---
 vrp_data <- read.csv("../data/vrp_data.csv")
+vehicles <- read.csv("../data/vehicles.csv")
+fuel_stations <- read.csv("../data/fuel_stations.csv")
 
-# Координаты депо
+max_id <- max(vrp_data$id)
+fuel_stations$id <- (max_id + 1):(max_id + nrow(fuel_stations))
+
+
+options(osrm.server = "http://127.0.0.1:5000/")
+options(osrm.profile = "car")
+
+# Депо
 depot_coords <- c(vrp_data$lat[1], vrp_data$lon[1])
-options(digits = 15)
-
-# Клиенты
 customers <- vrp_data[-1, ]
 n_customers <- nrow(customers)
 
-locations <- vrp_data %>% select(id, lon, lat)
+all_locations <- rbind(
+  data.frame(id = 0, lon = depot_coords[2], lat = depot_coords[1]),
+  customers %>% select(id, lon, lat),
+  fuel_stations %>% select(id, lon, lat)
+)
 
+# --- БЛОК 3: МАТРИЦА РАССТОЯНИЙ И ВРЕМЕНИ ---
 dist_obj <- osrmTable(
-  src = locations[c("lon", "lat")],
-  dst = locations[c("lon", "lat")],
+  src = all_locations[c("lon", "lat")],
+  dst = all_locations[c("lon", "lat")],
   measure = c("duration", "distance")
 )
 
-time_matrix <- dist_obj$durations # время (мин)
-dist_matrix <- dist_obj$distances # расстояние (м)
+time_matrix <- dist_obj$durations
+dist_matrix <- dist_obj$distances
 
-print("Данные загружены и матрицы построены.")
+print("Матрицы расстояний и времени построены.")
 
-# --- БЛОК 3: ФИТНЕС-ФУНКЦИЯ ---
+# --- БЛОК 4: ФИТНЕС-ФУНКЦИЯ С ЗАПРАВКАМИ ---
 fitness_vrptw <- function(tour) {
-  total_dist <- 0
+  total_cost <- 0
   total_penalties <- 0
+  trucks_used <- 0
 
   truck_load <- 0
   truck_time <- 0
   current_node_idx <- 1
-  trucks_used <- 1
+  truck_idx <- 1
+  vehicle <- vehicles[truck_idx, ]
+  current_fuel <- vehicle$tank_capacity
 
   for (i in 1:length(tour)) {
     client_id <- tour[i]
     matrix_idx <- client_id + 1
-
     row_idx <- which(customers$id == client_id)
 
     dem <- customers$demand[row_idx]
@@ -57,195 +68,243 @@ fitness_vrptw <- function(tour) {
     due <- customers$due_time[row_idx]
     service <- customers$service_time[row_idx]
 
-    # 1. Проверка: Влезет ли груз?
-    if (truck_load + dem > truck_capacity) {
-      total_dist <- total_dist + dist_matrix[current_node_idx, 1]
+    # --- Проверка вместимости ---
+    if (truck_load + dem > vehicle$capacity) {
+      total_cost <- total_cost + vehicle$cost_per_km * (dist_matrix[current_node_idx, 1] / 1000)
       trucks_used <- trucks_used + 1
+      truck_idx <- ((truck_idx) %% nrow(vehicles)) + 1
+      vehicle <- vehicles[truck_idx, ]
       truck_load <- 0
       truck_time <- 0
       current_node_idx <- 1
+      current_fuel <- vehicle$tank_capacity
     }
 
-    # 2. Едем к клиенту
-    travel_time <- time_matrix[current_node_idx, matrix_idx]
+    # --- Расчет пути к клиенту ---
     travel_dist <- dist_matrix[current_node_idx, matrix_idx]
+    travel_time <- time_matrix[current_node_idx, matrix_idx]
+    fuel_needed <- (travel_dist / 1000) * vehicle$fuel_consumption_per_km
+
+    # --- Проверка топлива и заправка ---
+    if (fuel_needed + vehicle$required_end_fuel > current_fuel) {
+      # ищем ближайшую заправку
+      station_idx <- which.min(sqrt((fuel_stations$lat - customers$lat[row_idx])^2 +
+        (fuel_stations$lon - customers$lon[row_idx])^2))
+      station <- fuel_stations[station_idx, ]
+      station_matrix_idx <- n_customers + 2 + station_idx
+
+      dist_to_station <- dist_matrix[current_node_idx, station_matrix_idx]
+      time_to_station <- time_matrix[current_node_idx, station_matrix_idx]
+      fuel_cost <- (vehicle$tank_capacity - current_fuel) * station$fuel_price
+
+      total_cost <- total_cost + vehicle$cost_per_km * (dist_to_station / 1000) + fuel_cost
+
+      # Обновление позиции и топлива
+      current_node_idx <- station_matrix_idx
+      current_fuel <- vehicle$tank_capacity
+      truck_time <- truck_time + time_to_station
+    }
 
     arrival_time <- truck_time + travel_time
+    if (arrival_time > due) total_penalties <- total_penalties + penalty_late
+    if (arrival_time < ready) arrival_time <- ready
 
-    # 3. Проверка времени
-    if (arrival_time > due) {
-      total_penalties <- total_penalties + penalty_late
-    }
-    if (arrival_time < ready) {
-      arrival_time <- ready
-    }
-
-    # 4. Обслуживаем
+    # --- Обновление состояния грузовика ---
     truck_load <- truck_load + dem
     truck_time <- arrival_time + service
-    total_dist <- total_dist + travel_dist
+    current_fuel <- current_fuel - fuel_needed
+
+    if (truck_load == dem) total_cost <- total_cost + vehicle$fixed_cost
+    total_cost <- total_cost + vehicle$cost_per_km * (travel_dist / 1000)
     current_node_idx <- matrix_idx
   }
 
-  # Возврат последней машины в депо
-  total_dist <- total_dist + dist_matrix[current_node_idx, 1]
-
-  # Штрафы за лишние машины
-  if (trucks_used > max_trucks) {
-    total_penalties <- total_penalties + penalty_overload
-  }
+  total_cost <- total_cost + vehicle$cost_per_km * (dist_matrix[current_node_idx, 1] / 1000)
+  trucks_used <- trucks_used + 1
   total_penalties <- total_penalties + (trucks_used * penalty_truck)
 
-  return(-(total_dist + total_penalties))
+  return(-(total_cost + total_penalties)) # nolint: return_linter.
 }
 
-# --- БЛОК 4: ЗАПУСК GA ---
-print("Запуск алгоритма... Пожалуйста, подождите.")
-
+# --- БЛОК 5: ЗАПУСК GA ---
 ga_result <- ga(
   type = "permutation",
   fitness = fitness_vrptw,
   lower = 1,
   upper = n_customers,
-  popSize = 2000,
-  maxiter = 5000,
-  run = 100,
+  popSize = 500,
+  maxiter = 1000,
+  run = 50,
   pmutation = 0.4,
   monitor = TRUE
 )
 
-# Извлечение лучшего решения
 best_solution <- ga_result@solution[1, ]
 print("Алгоритм завершен!")
 
-# --- БЛОК 5: КАРТА С РЕАЛЬНЫМИ ДОРОГАМИ (OSRM) ---
-
-print("Построение детальных маршрутов... Это может занять время.")
-
-# 1. Функция получения детальной геометрии маршрутов
+# --- БЛОК 6: ВИЗУАЛИЗАЦИЯ МАРШРУТОВ С ЗАПРАВКАМИ ---
 get_detailed_routes <- function(tour) {
-  routes_sf <- list() # Список для хранения sf объектов (линий)
+  routes_sf <- list()
   truck_load <- 0
-  truck_id <- 1
-  
-  # Координаты склада (lon, lat) для osrm
-  curr_pos <- c(depot_coords[2], depot_coords[1]) 
-  depot_pos <- c(depot_coords[2], depot_coords[1])
-  
-  # Временный список сегментов для одной машины
+  truck_idx <- 1
+  vehicle <- vehicles[truck_idx, ]
+  current_fuel <- vehicle$tank_capacity
+  curr_pos <- c(depot_coords[2], depot_coords[1])
+  depot_pos <- curr_pos
   trip_segments <- list()
-  
+  current_node_idx <- 1 # начнем с депо
+
   for (i in 1:length(tour)) {
     client_id <- tour[i]
     client_row <- customers[customers$id == client_id, ]
     target_pos <- c(client_row$lon, client_row$lat)
-    dem <- client_row$demand
-    
-    # Проверка вместимости (как в фитнес-функции)
-    if (truck_load + dem > truck_capacity) {
-      # 1. Едем обратно в депо
+    matrix_idx <- client_id + 1
+    travel_dist <- dist_matrix[current_node_idx, matrix_idx]
+    fuel_needed <- (travel_dist / 1000) * vehicle$fuel_consumption_per_km
+
+    # --- Смена грузовика или превышение объема ---
+    if (truck_load + client_row$demand > vehicle$capacity) {
+      # маршрут к депо
       route_segment <- osrmRoute(src = curr_pos, dst = depot_pos, overview = "full", returnclass = "sf")
       trip_segments[[length(trip_segments) + 1]] <- route_segment
-      
-      # Сохраняем маршрут текущего грузовика (объединяем сегменты)
-      if(length(trip_segments) > 0) {
-        routes_sf[[truck_id]] <- do.call(rbind, trip_segments)
-      }
-      
-      # 2. Сброс для нового грузовика
-      truck_id <- truck_id + 1
+      routes_sf[[truck_idx]] <- do.call(rbind, trip_segments)
+
+      truck_idx <- ((truck_idx) %% nrow(vehicles)) + 1
+      vehicle <- vehicles[truck_idx, ]
       truck_load <- 0
+      current_fuel <- vehicle$tank_capacity
       curr_pos <- depot_pos
       trip_segments <- list()
+      current_node_idx <- 1
     }
-    
-    # Едем к клиенту (запрос реальной дороги)
-    # overview = "full" дает полную геометрию поворотов
+
+    # --- Дозаправка, если топлива не хватает ---
+    if (fuel_needed + vehicle$required_end_fuel > current_fuel) {
+      station_idx <- which.min(sqrt((fuel_stations$lat - client_row$lat)^2 +
+        (fuel_stations$lon - client_row$lon)^2))
+      station <- fuel_stations[station_idx, ]
+      station_pos <- c(station$lon, station$lat)
+      station_matrix_idx <- n_customers + 2 + station_idx
+
+      # маршрут до заправки
+      route_segment <- osrmRoute(src = curr_pos, dst = station_pos, overview = "full", returnclass = "sf")
+      trip_segments[[length(trip_segments) + 1]] <- route_segment
+
+      curr_pos <- station_pos
+      current_fuel <- vehicle$tank_capacity
+      current_node_idx <- station_matrix_idx
+    }
+
+    # --- Маршрут до клиента ---
     route_segment <- osrmRoute(src = curr_pos, dst = target_pos, overview = "full", returnclass = "sf")
     trip_segments[[length(trip_segments) + 1]] <- route_segment
-    
-    truck_load <- truck_load + dem
+
+    truck_load <- truck_load + client_row$demand
+    current_fuel <- current_fuel - fuel_needed
     curr_pos <- target_pos
+    current_node_idx <- matrix_idx
   }
-  
-  # Возврат последнего грузовика в депо
+
+  # --- Возврат в депо ---
   route_segment <- osrmRoute(src = curr_pos, dst = depot_pos, overview = "full", returnclass = "sf")
   trip_segments[[length(trip_segments) + 1]] <- route_segment
-  routes_sf[[truck_id]] <- do.call(rbind, trip_segments)
-  
+  routes_sf[[truck_idx]] <- do.call(rbind, trip_segments)
+
   return(routes_sf)
 }
 
-# 2. Получение данных (это займет время на запросы к API)
+
+# --- БЛОК 7: ВИЗУАЛИЗАЦИЯ КАРТЫ ---
 truck_routes_sf <- get_detailed_routes(best_solution)
 colors <- colorFactor(palette = "Set1", domain = 1:length(truck_routes_sf))
 
-# 3. Инициализация карты
+depot_icon <- makeIcon(
+  iconUrl = "https://cdn-icons-png.flaticon.com/512/664/664468.png",
+  iconWidth = 40,
+  iconHeight = 40
+)
+fuel_icon <- makeIcon(
+  iconUrl = "https://cdn-icons-png.flaticon.com/512/1505/1505662.png",
+  iconWidth = 30,
+  iconHeight = 30
+)
+customer_icon <- makeIcon(
+  iconUrl = "   https://cdn-icons-png.flaticon.com/512/126/126122.png ",
+  iconWidth = 30,
+  iconHeight = 30
+)
+
+
 map <- leaflet() %>%
   addTiles() %>%
   addMarkers(
     lng = depot_coords[2], lat = depot_coords[1],
     popup = "<b>СКЛАД (DEPOT)</b>",
-    icon = makeIcon(iconUrl = "https://cdn-icons-png.flaticon.com/512/664/664468.png", iconWidth = 40, iconHeight = 40)
+    icon = depot_icon
   ) %>%
-  addCircleMarkers(
-    data = customers, lng = ~lon, lat = ~lat,
-    radius = 6, color = "navy", fillOpacity = 0.8,
-    popup = ~ paste("<b>Client ID:</b>", id, "<br>Demand:", demand, "kg")
+  addMarkers(
+    data = customers,
+    lng = ~lon, lat = ~lat,
+    popup = ~ paste("<b>Client ID:</b>", id, "<br>Demand:", demand, "кг"),
+    icon = customer_icon,
+    group = "Clients"
+  ) %>%
+  addMarkers(
+    data = fuel_stations, lng = ~lon, lat = ~lat,
+    popup = ~ paste("<b>Fuel Station ID:</b>", id, "<br>Price:", fuel_price),
+    icon = fuel_icon,
+    group = "Fuel Stations"
+  ) %>%
+  addLayersControl(
+    overlayGroups = c("Clients", "Fuel Stations"),
+    options = layersControlOptions(collapsed = FALSE)
   )
 
-# 4. Добавление слоев с маршрутами
+
 for (i in 1:length(truck_routes_sf)) {
-  # Проверяем, есть ли данные для маршрута
   if (!is.null(truck_routes_sf[[i]])) {
-    map <- map %>%
-      addPolylines(
-        data = truck_routes_sf[[i]],
-        color = colors(i),
-        weight = 4,
-        opacity = 0.8,
-        group = paste("Truck", i),
-        popup = paste("Маршрут машины №", i)
-      )
+    map <- map %>% addPolylines(
+      data = truck_routes_sf[[i]],
+      color = colors(i), weight = 4, opacity = 0.8,
+      group = paste("Truck", i),
+      popup = paste("Маршрут машины №", i)
+    )
   }
 }
 
-# Управление слоями
 map <- map %>% addLayersControl(
-  overlayGroups = paste("Truck", 1:length(truck_routes_sf)),
+  overlayGroups = c(paste("Truck", 1:length(truck_routes_sf)), "Fuel Stations"),
   options = layersControlOptions(collapsed = FALSE)
 )
 
 print(map)
-print("Карта с дорогами построена.")
 
-# --- БЛОК 6: ОТЧЕТ (MANIFEST) ---
+# --- БЛОК 8: МАНИФЕСТ ---
+format_time <- function(minutes) {
+  hours <- floor(minutes / 60)
+  mins <- round(minutes %% 60)
+  sprintf("%02d:%02d", hours %% 24, mins)
+}
+
 print_manifest <- function(tour) {
-  cat("\n======================================================================\n")
-  cat("                     ЛОГИСТИЧЕСКОЕ РАСПИСАНИЕ                         \n")
-  cat("======================================================================\n")
-
+  cat("\n==================== РАСПИСАНИЕ ====================\n")
   current_trip_clients <- c()
   current_trip_load <- 0
   truck_num <- 1
+  vehicle <- vehicles[truck_num, ]
+  current_fuel <- vehicle$tank_capacity
 
   process_truck <- function(clients_list, t_num) {
     if (length(clients_list) == 0) {
       return()
     }
+    cat(paste0("\n[ ГРУЗОВИК № ", t_num, " | Тип: ", vehicle$vehicle_type, " ]\n"))
+    cat("ID | Статус | Прибытие | Окно | Разгрузка | Груз | Стоимость | Топливо\n")
 
-    # ФИКСИРОВАННЫЙ СТАРТ (06:00)
-    start_time <- 360
-    start_h <- floor(start_time / 60)
-    start_m <- round(start_time %% 60)
-
-    cat(paste0("\n[ ГРУЗОВИК № ", t_num, " ]\n"))
-    cat("-------------------------------------------------------------------------------------\n")
-    cat(sprintf("%-4s | %-10s | %-10s | %-13s | %-10s | %-10s\n", "ID", "Статус", "Прибытие", "Окно", "Разгрузка", "Груз"))
-    cat("-------------------------------------------------------------------------------------\n")
-
-    truck_time <- start_time
+    truck_time <- 360
     curr_loc <- 1
+    total_cost <- 0
+    current_fuel <- vehicle$tank_capacity
 
     for (client_id in clients_list) {
       row_idx <- which(customers$id == client_id)
@@ -255,32 +314,49 @@ print_manifest <- function(tour) {
       service <- customers$service_time[row_idx]
 
       travel <- time_matrix[curr_loc, client_id + 1]
-      arrival <- truck_time + travel
+      travel_dist <- dist_matrix[curr_loc, client_id + 1]
+      fuel_needed <- (travel_dist / 1000) * vehicle$fuel_consumption_per_km
 
-      status <- "OK"
-      if (arrival > due) status <- "! LATE"
-      if (arrival < ready) {
-        status <- "Wait"
-        arrival <- ready
+      fuel_event <- ""
+      if (fuel_needed + vehicle$required_end_fuel > current_fuel) {
+        station_idx <- which.min(sqrt((fuel_stations$lat - customers$lat[row_idx])^2 +
+          (fuel_stations$lon - customers$lon[row_idx])^2))
+        station <- fuel_stations[station_idx, ]
+        station_matrix_idx <- n_customers + 2 + station_idx
+
+        dist_to_station <- dist_matrix[curr_loc, station_matrix_idx]
+        time_to_station <- time_matrix[curr_loc, station_matrix_idx]
+        fuel_cost <- (vehicle$tank_capacity - current_fuel) * station$fuel_price
+
+        total_cost <- total_cost + vehicle$cost_per_km * (dist_to_station / 1000) + fuel_cost
+        truck_time <- truck_time + time_to_station
+        current_fuel <- vehicle$tank_capacity
+        curr_loc <- station_matrix_idx
+        fuel_event <- paste0("Заправка на станции ID ", station$id)
       }
 
-      arr_rounded <- round(arrival)
-      time_str <- sprintf("%02d:%02d", floor(arr_rounded / 60), arr_rounded %% 60)
+      arrival <- truck_time + travel
+      status <- "OK"
+      if (arrival > due) status <- "! LATE"
+      if (arrival < ready) arrival <- ready
 
-      ready_rounded <- round(ready)
-      due_rounded <- round(due)
-      window_str <- sprintf("%02d:%02d-%02d:%02d", floor(ready_rounded / 60), ready_rounded %% 60, floor(due_rounded / 60), due_rounded %% 60)
+      cost <- vehicle$cost_per_km * (travel_dist / 1000)
+      total_cost <- total_cost + cost
+      current_fuel <- current_fuel - fuel_needed
+      curr_loc <- client_id + 1
+      truck_time <- arrival + service
 
       cat(sprintf(
-        "%-4d | %-10s | %-10s | %-13s | %-10s | %-10s\n",
-        client_id, status, time_str, window_str, paste(service, "мин"), paste(dem, "кг")
+        "%-4d | %-7s | %-8s | %-13s | %-10s | %-6d | %-8.2f | %s\n",
+        client_id, status,
+        format_time(arrival),
+        format_time(ready),
+        format_time(due),
+        dem, cost, fuel_event
       ))
-
-      truck_time <- arrival + service
-      curr_loc <- client_id + 1
     }
-    cat("-------------------------------------------------------------------------------------\n")
-    cat(sprintf(">> ВОЗВРАТ В ДЕПО. Итого загрузка: %d / %d кг\n", current_trip_load, truck_capacity))
+
+    cat(paste(">> Итого стоимость маршрута:", total_cost, "\n"))
   }
 
   for (i in 1:length(tour)) {
@@ -288,19 +364,19 @@ print_manifest <- function(tour) {
     row_idx <- which(customers$id == client_id)
     dem <- customers$demand[row_idx]
 
-    if (current_trip_load + dem > truck_capacity) {
+    if (current_trip_load + dem > vehicle$capacity) {
       process_truck(current_trip_clients, truck_num)
-      truck_num <- truck_num + 1
+      truck_num <- min(truck_num + 1, nrow(vehicles))
+      vehicle <- vehicles[truck_num, ]
       current_trip_clients <- c()
       current_trip_load <- 0
+      current_fuel <- vehicle$tank_capacity
     }
 
     current_trip_clients <- c(current_trip_clients, client_id)
     current_trip_load <- current_trip_load + dem
   }
   process_truck(current_trip_clients, truck_num)
-  cat("\n======================================================================\n")
 }
 
-# Запуск отчета
 print_manifest(best_solution)
